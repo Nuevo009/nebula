@@ -1,29 +1,45 @@
-package nebula
+package overlay
 
 import (
 	"fmt"
 	"math"
 	"net"
+	"runtime"
 	"strconv"
 
+	"github.com/sirupsen/logrus"
+	"github.com/slackhq/nebula/cidr"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/iputil"
 )
 
-const DEFAULT_MTU = 1300
-
-type route struct {
-	mtu    int
-	metric int
-	route  *net.IPNet
-	via    *net.IP
+type Route struct {
+	MTU    int
+	Metric int
+	Cidr   *net.IPNet
+	Via    *iputil.VpnIp
 }
 
-func parseRoutes(c *config.C, network *net.IPNet) ([]route, error) {
+func makeRouteTree(l *logrus.Logger, routes []Route, allowMTU bool) (*cidr.Tree4, error) {
+	routeTree := cidr.NewTree4()
+	for _, r := range routes {
+		if !allowMTU && r.MTU > 0 {
+			l.WithField("route", r).Warnf("route MTU is not supported in %s", runtime.GOOS)
+		}
+
+		if r.Via != nil {
+			routeTree.AddCIDR(r.Cidr, *r.Via)
+		}
+	}
+	return routeTree, nil
+}
+
+func parseRoutes(c *config.C, network *net.IPNet) ([]Route, error) {
 	var err error
 
 	r := c.Get("tun.routes")
 	if r == nil {
-		return []route{}, nil
+		return []Route{}, nil
 	}
 
 	rawRoutes, ok := r.([]interface{})
@@ -32,10 +48,10 @@ func parseRoutes(c *config.C, network *net.IPNet) ([]route, error) {
 	}
 
 	if len(rawRoutes) < 1 {
-		return []route{}, nil
+		return []Route{}, nil
 	}
 
-	routes := make([]route, len(rawRoutes))
+	routes := make([]Route, len(rawRoutes))
 	for i, r := range rawRoutes {
 		m, ok := r.(map[interface{}]interface{})
 		if !ok {
@@ -64,20 +80,20 @@ func parseRoutes(c *config.C, network *net.IPNet) ([]route, error) {
 			return nil, fmt.Errorf("entry %v.route in tun.routes is not present", i+1)
 		}
 
-		r := route{
-			mtu: mtu,
+		r := Route{
+			MTU: mtu,
 		}
 
-		_, r.route, err = net.ParseCIDR(fmt.Sprintf("%v", rRoute))
+		_, r.Cidr, err = net.ParseCIDR(fmt.Sprintf("%v", rRoute))
 		if err != nil {
 			return nil, fmt.Errorf("entry %v.route in tun.routes failed to parse: %v", i+1, err)
 		}
 
-		if !ipWithin(network, r.route) {
+		if !ipWithin(network, r.Cidr) {
 			return nil, fmt.Errorf(
 				"entry %v.route in tun.routes is not contained within the network attached to the certificate; route: %v, network: %v",
 				i+1,
-				r.route.String(),
+				r.Cidr.String(),
 				network.String(),
 			)
 		}
@@ -88,12 +104,12 @@ func parseRoutes(c *config.C, network *net.IPNet) ([]route, error) {
 	return routes, nil
 }
 
-func parseUnsafeRoutes(c *config.C, network *net.IPNet) ([]route, error) {
+func parseUnsafeRoutes(c *config.C, network *net.IPNet) ([]Route, error) {
 	var err error
 
 	r := c.Get("tun.unsafe_routes")
 	if r == nil {
-		return []route{}, nil
+		return []Route{}, nil
 	}
 
 	rawRoutes, ok := r.([]interface{})
@@ -102,31 +118,29 @@ func parseUnsafeRoutes(c *config.C, network *net.IPNet) ([]route, error) {
 	}
 
 	if len(rawRoutes) < 1 {
-		return []route{}, nil
+		return []Route{}, nil
 	}
 
-	routes := make([]route, len(rawRoutes))
+	routes := make([]Route, len(rawRoutes))
 	for i, r := range rawRoutes {
 		m, ok := r.(map[interface{}]interface{})
 		if !ok {
 			return nil, fmt.Errorf("entry %v in tun.unsafe_routes is invalid", i+1)
 		}
 
-		rMtu, ok := m["mtu"]
-		if !ok {
-			rMtu = c.GetInt("tun.mtu", DEFAULT_MTU)
-		}
-
-		mtu, ok := rMtu.(int)
-		if !ok {
-			mtu, err = strconv.Atoi(rMtu.(string))
-			if err != nil {
-				return nil, fmt.Errorf("entry %v.mtu in tun.unsafe_routes is not an integer: %v", i+1, err)
+		var mtu int
+		if rMtu, ok := m["mtu"]; ok {
+			mtu, ok = rMtu.(int)
+			if !ok {
+				mtu, err = strconv.Atoi(rMtu.(string))
+				if err != nil {
+					return nil, fmt.Errorf("entry %v.mtu in tun.unsafe_routes is not an integer: %v", i+1, err)
+				}
 			}
-		}
 
-		if mtu < 500 {
-			return nil, fmt.Errorf("entry %v.mtu in tun.unsafe_routes is below 500: %v", i+1, mtu)
+			if mtu != 0 && mtu < 500 {
+				return nil, fmt.Errorf("entry %v.mtu in tun.unsafe_routes is below 500: %v", i+1, mtu)
+			}
 		}
 
 		rMetric, ok := m["metric"]
@@ -166,22 +180,24 @@ func parseUnsafeRoutes(c *config.C, network *net.IPNet) ([]route, error) {
 			return nil, fmt.Errorf("entry %v.route in tun.unsafe_routes is not present", i+1)
 		}
 
-		r := route{
-			via:    &nVia,
-			mtu:    mtu,
-			metric: metric,
+		viaVpnIp := iputil.Ip2VpnIp(nVia)
+
+		r := Route{
+			Via:    &viaVpnIp,
+			MTU:    mtu,
+			Metric: metric,
 		}
 
-		_, r.route, err = net.ParseCIDR(fmt.Sprintf("%v", rRoute))
+		_, r.Cidr, err = net.ParseCIDR(fmt.Sprintf("%v", rRoute))
 		if err != nil {
 			return nil, fmt.Errorf("entry %v.route in tun.unsafe_routes failed to parse: %v", i+1, err)
 		}
 
-		if ipWithin(network, r.route) {
+		if ipWithin(network, r.Cidr) {
 			return nil, fmt.Errorf(
 				"entry %v.route in tun.unsafe_routes is contained within the network attached to the certificate; route: %v, network: %v",
 				i+1,
-				r.route.String(),
+				r.Cidr.String(),
 				network.String(),
 			)
 		}

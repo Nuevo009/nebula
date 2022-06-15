@@ -10,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/overlay"
 	"github.com/slackhq/nebula/sshd"
 	"github.com/slackhq/nebula/udp"
 	"github.com/slackhq/nebula/util"
@@ -17,6 +18,11 @@ import (
 )
 
 type m map[string]interface{}
+
+type netIpAndPort struct {
+	ip   net.IP
+	port uint16
+}
 
 func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logger, tunFd *int) (retcon *Control, reterr error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -77,14 +83,6 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 
 	// TODO: make sure mask is 4 bytes
 	tunCidr := cs.certificate.Details.Ips[0]
-	routes, err := parseRoutes(c, tunCidr)
-	if err != nil {
-		return nil, util.NewContextualError("Could not parse tun.routes", nil, err)
-	}
-	unsafeRoutes, err := parseUnsafeRoutes(c, tunCidr)
-	if err != nil {
-		return nil, util.NewContextualError("Could not parse tun.unsafe_routes", nil, err)
-	}
 
 	ssh, err := sshd.NewSSHServer(l.WithField("subsystem", "sshd"))
 	wireSSHReload(l, ssh, c)
@@ -137,46 +135,21 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 		l.WithField("duration", conntrackCacheTimeout).Info("Using routine-local conntrack cache")
 	}
 
-	var tun Inside
+	var tun overlay.Device
 	if !configTest {
 		c.CatchHUP(ctx)
 
-		switch {
-		case c.GetBool("tun.disabled", false):
-			tun = newDisabledTun(tunCidr, c.GetInt("tun.tx_queue", 500), c.GetBool("stats.message_metrics", false), l)
-		case tunFd != nil:
-			tun, err = newTunFromFd(
-				l,
-				*tunFd,
-				tunCidr,
-				c.GetInt("tun.mtu", DEFAULT_MTU),
-				routes,
-				unsafeRoutes,
-				c.GetInt("tun.tx_queue", 500),
-			)
-		default:
-			tun, err = newTun(
-				l,
-				c.GetString("tun.dev", ""),
-				tunCidr,
-				c.GetInt("tun.mtu", DEFAULT_MTU),
-				routes,
-				unsafeRoutes,
-				c.GetInt("tun.tx_queue", 500),
-				routines > 1,
-			)
-		}
-
+		tun, err = overlay.NewDeviceFromConfig(c, l, tunCidr, tunFd, routines)
 		if err != nil {
 			return nil, util.NewContextualError("Failed to get a tun/tap device", nil, err)
 		}
-	}
 
-	defer func() {
-		if reterr != nil {
-			tun.Close()
-		}
-	}()
+		defer func() {
+			if reterr != nil {
+				tun.Close()
+			}
+		}()
+	}
 
 	// set up our UDP listener
 	udpConns := make([]*udp.Conn, routines)
@@ -241,8 +214,6 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 	}
 
 	hostMap := NewHostMap(l, "main", tunCidr, preferredRanges)
-
-	hostMap.addUnsafeRoutes(&unsafeRoutes)
 	hostMap.metricsEnabled = c.GetBool("stats.message_metrics", false)
 
 	l.WithField("network", hostMap.vpnCIDR).WithField("preferredRanges", hostMap.preferredRanges).Info("Main HostMap created")
@@ -283,6 +254,31 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 		lighthouseHosts[i] = iputil.Ip2VpnIp(ip)
 	}
 
+	if !amLighthouse && len(lighthouseHosts) == 0 {
+		l.Warn("No lighthouses.hosts configured, this host will only be able to initiate tunnels with static_host_map entries")
+	}
+
+	rawForceReportAddrs := c.GetStringSlice("lighthouse.x_force_report_addrs", []string{})
+	forceReportAddrs := make([]netIpAndPort, 0)
+
+	for i, rawAddr := range rawForceReportAddrs {
+		fIp, fPort, err := udp.ParseIPAndPort(rawAddr)
+		if err != nil {
+			return nil, util.NewContextualError("Unable to parse lighthouse.x_force_report_addrs entry", m{"addr": rawAddr, "entry": i + 1}, err)
+		}
+
+		if fPort == 0 {
+			fPort = uint16(port)
+		}
+
+		if ip4 := fIp.To4(); ip4 != nil && tunCidr.Contains(fIp) {
+			l.WithField("addr", rawAddr).WithField("entry", i+1).Warn("Ignoring forced ip report because it is within the nebula network range")
+			continue
+		}
+
+		forceReportAddrs = append(forceReportAddrs, netIpAndPort{ip: fIp, port: fPort})
+	}
+
 	lightHouse := NewLightHouse(
 		l,
 		amLighthouse,
@@ -295,6 +291,7 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 		punchy.Respond,
 		punchy.Delay,
 		c.GetBool("stats.lighthouse_metrics", false),
+		forceReportAddrs,
 	)
 
 	remoteAllowList, err := NewRemoteAllowListFromConfig(c, "lighthouse.remote_allow_list", "lighthouse.remote_allow_ranges")

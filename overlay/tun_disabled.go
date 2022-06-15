@@ -1,4 +1,4 @@
-package nebula
+package overlay
 
 import (
 	"encoding/binary"
@@ -9,6 +9,7 @@ import (
 
 	"github.com/rcrowley/go-metrics"
 	"github.com/sirupsen/logrus"
+	"github.com/slackhq/nebula/iputil"
 )
 
 type disabledTun struct {
@@ -43,11 +44,15 @@ func (*disabledTun) Activate() error {
 	return nil
 }
 
-func (t *disabledTun) CidrNet() *net.IPNet {
+func (*disabledTun) RouteFor(iputil.VpnIp) iputil.VpnIp {
+	return 0
+}
+
+func (t *disabledTun) Cidr() *net.IPNet {
 	return t.cidr
 }
 
-func (*disabledTun) DeviceName() string {
+func (*disabledTun) Name() string {
 	return "disabled"
 }
 
@@ -71,7 +76,8 @@ func (t *disabledTun) Read(b []byte) (int, error) {
 
 func (t *disabledTun) handleICMPEchoRequest(b []byte) bool {
 	// Return early if this is not a simple ICMP Echo Request
-	if !(len(b) >= 28 && len(b) <= mtu && b[0] == 0x45 && b[9] == 0x01 && b[20] == 0x08) {
+	//TODO: make constants out of these
+	if !(len(b) >= 28 && len(b) <= 9001 && b[0] == 0x45 && b[9] == 0x01 && b[20] == 0x08) {
 		return false
 	}
 
@@ -120,11 +126,6 @@ func (t *disabledTun) Write(b []byte) (int, error) {
 		t.l.WithField("raw", prettyPacket(b)).Debugf("Disabled tun received unexpected payload")
 	}
 	return len(b), nil
-}
-
-func (t *disabledTun) WriteRaw(b []byte) error {
-	_, err := t.Write(b)
-	return err
 }
 
 func (t *disabledTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
